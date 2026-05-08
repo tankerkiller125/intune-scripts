@@ -17,7 +17,9 @@ param(
     [switch]$VerboseMode,
     [switch]$DryRun,
     [switch]$WithBackup,
-    [switch]$RestoreBackup
+    [switch]$RestoreBackup,
+    [switch]$UpdateAtAnyCost,
+    [string[]]$IgnoreList = @('C:\ProgramData\IntuneOpenSSLRemediation\*')
 )
 
 Set-StrictMode -Version Latest
@@ -328,6 +330,210 @@ function Test-FileLockState {
     }
 }
 
+function Ensure-RestartManagerInterop {
+    if ('RestartManager.NativeMethods' -as [type]) {
+        return
+    }
+
+    Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+
+namespace RestartManager {
+    public static class NativeMethods {
+        [StructLayout(LayoutKind.Sequential)]
+        public struct RM_UNIQUE_PROCESS {
+            public int dwProcessId;
+            public System.Runtime.InteropServices.ComTypes.FILETIME ProcessStartTime;
+        }
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        public struct RM_PROCESS_INFO {
+            public RM_UNIQUE_PROCESS Process;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)]
+            public string strAppName;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 64)]
+            public string strServiceShortName;
+            public uint ApplicationType;
+            public uint AppStatus;
+            public uint TSSessionId;
+            [MarshalAs(UnmanagedType.Bool)]
+            public bool bRestartable;
+        }
+
+        [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)]
+        public static extern int RmStartSession(out uint pSessionHandle, int dwSessionFlags, string strSessionKey);
+
+        [DllImport("rstrtmgr.dll")]
+        public static extern int RmEndSession(uint pSessionHandle);
+
+        [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)]
+        public static extern int RmRegisterResources(
+            uint pSessionHandle,
+            uint nFiles,
+            string[] rgsFileNames,
+            uint nApplications,
+            IntPtr rgApplications,
+            uint nServices,
+            string[] rgsServiceNames);
+
+        [DllImport("rstrtmgr.dll")]
+        public static extern int RmGetList(
+            uint dwSessionHandle,
+            out uint pnProcInfoNeeded,
+            ref uint pnProcInfo,
+            [In, Out] RM_PROCESS_INFO[] rgAffectedApps,
+            ref uint lpdwRebootReasons);
+    }
+}
+"@
+}
+
+function Get-LockingProcessIds {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    Ensure-RestartManagerInterop
+
+    $sessionKey = [guid]::NewGuid().ToString()
+    $handle = 0
+    $startRes = [RestartManager.NativeMethods]::RmStartSession([ref]$handle, 0, $sessionKey)
+    if ($startRes -ne 0) {
+        Write-Verbose ("Restart Manager start failed ({0}) for {1}" -f $startRes, $Path)
+        return @()
+    }
+
+    try {
+        $registerRes = [RestartManager.NativeMethods]::RmRegisterResources($handle, 1, [string[]]@($Path), 0, [IntPtr]::Zero, 0, $null)
+        if ($registerRes -ne 0) {
+            Write-Verbose ("Restart Manager register failed ({0}) for {1}" -f $registerRes, $Path)
+            return @()
+        }
+
+        $needed = 0
+        $count = 0
+        $reboot = 0
+        $listRes = [RestartManager.NativeMethods]::RmGetList($handle, [ref]$needed, [ref]$count, $null, [ref]$reboot)
+
+        if ($listRes -eq 0 -or $needed -eq 0) {
+            return @()
+        }
+
+        $apps = New-Object RestartManager.NativeMethods+RM_PROCESS_INFO[] $needed
+        $count = $needed
+        $listRes = [RestartManager.NativeMethods]::RmGetList($handle, [ref]$needed, [ref]$count, $apps, [ref]$reboot)
+        if ($listRes -ne 0) {
+            Write-Verbose ("Restart Manager list failed ({0}) for {1}" -f $listRes, $Path)
+            return @()
+        }
+
+        $ids = New-Object System.Collections.Generic.List[int]
+        for ($i = 0; $i -lt $count; $i++) {
+            $pid = $apps[$i].Process.dwProcessId
+            if ($pid -gt 0 -and -not $ids.Contains($pid)) {
+                $ids.Add($pid)
+            }
+        }
+        return $ids.ToArray()
+    }
+    finally {
+        [void][RestartManager.NativeMethods]::RmEndSession($handle)
+    }
+}
+
+function Stop-LockingProcesses {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $pids = @(Get-LockingProcessIds -Path $Path)
+    if ($pids.Count -eq 0) {
+        return 0
+    }
+
+    $killed = 0
+    foreach ($pid in $pids) {
+        if ($pid -eq $PID -or $pid -eq 0 -or $pid -eq 4) {
+            continue
+        }
+
+        try {
+            $proc = Get-Process -Id $pid -ErrorAction Stop
+            Write-Output ("UpdateAtAnyCost: Stopping PID {0} ({1}) locking {2}" -f $pid, $proc.ProcessName, $Path)
+            Stop-Process -Id $pid -Force -ErrorAction Stop
+            $killed++
+        }
+        catch {
+            Write-Verbose ("Could not stop PID {0} for {1}: {2}" -f $pid, $Path, $_.Exception.Message)
+        }
+    }
+
+    return $killed
+}
+
+function Clear-RemediationWorkArtifacts {
+    param([Parameter(Mandatory = $true)][string]$WorkRoot)
+
+    if (-not (Test-Path -LiteralPath $WorkRoot)) {
+        return
+    }
+
+    $downloadDir = Join-Path $WorkRoot 'downloads'
+    $extractDir = Join-Path $WorkRoot 'extract'
+
+    foreach ($path in @($extractDir, $downloadDir)) {
+        if (Test-Path -LiteralPath $path) {
+            try {
+                Write-Verbose ("Cleaning remediation artifacts: {0}" -f $path)
+                Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction Stop
+            }
+            catch {
+                Write-Verbose ("Cleanup warning for {0}: {1}" -f $path, $_.Exception.Message)
+            }
+        }
+    }
+
+    try {
+        $remaining = @(Get-ChildItem -LiteralPath $WorkRoot -Force -ErrorAction SilentlyContinue)
+        if ($remaining.Count -eq 0) {
+            Remove-Item -LiteralPath $WorkRoot -Force -ErrorAction SilentlyContinue
+        }
+    }
+    catch {
+        Write-Verbose ("Cleanup warning for work root {0}: {1}" -f $WorkRoot, $_.Exception.Message)
+    }
+}
+
+function Test-IsIgnoredPath {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string[]]$Patterns
+    )
+
+    if ($null -eq $Patterns -or $Patterns.Count -eq 0) {
+        return $false
+    }
+
+    $target = $Path.Trim().TrimEnd('\\').ToLowerInvariant()
+    foreach ($rawPattern in $Patterns) {
+        if ([string]::IsNullOrWhiteSpace($rawPattern)) {
+            continue
+        }
+
+        $pattern = $rawPattern.Trim().TrimEnd('\\')
+        if ($pattern.Contains('*') -or $pattern.Contains('?')) {
+            if ($Path -like $pattern) {
+                return $true
+            }
+            continue
+        }
+
+        $normalized = $pattern.ToLowerInvariant()
+        if ($target -eq $normalized -or $target.StartsWith("$normalized\\")) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
 function Update-DllInPlace {
     param(
         [Parameter(Mandatory = $true)]$Entry,
@@ -381,6 +587,10 @@ function Restore-DllFromBackup {
 
 try {
     Write-Verbose 'Starting OpenSSL remediation run.'
+    if ($IgnoreList.Count -gt 0) {
+        Write-Output ("IgnoreList active. Entries: {0}" -f ($IgnoreList -join '; '))
+    }
+
     if ($DryRun) {
         Write-Output 'DryRun mode enabled. No files will be downloaded, extracted, or modified.'
     }
@@ -393,6 +603,14 @@ try {
         Write-Output 'RestoreBackup mode enabled. Script will restore DLLs from existing .bak files.'
     }
 
+    if ($UpdateAtAnyCost) {
+        Write-Output 'UpdateAtAnyCost mode enabled. Locking processes may be force-stopped to complete updates.'
+    }
+
+    if ($UpdateAtAnyCost -and $RestoreBackup) {
+        throw 'UpdateAtAnyCost cannot be combined with RestoreBackup.'
+    }
+
     if ($WithBackup -and $RestoreBackup) {
         throw 'WithBackup and RestoreBackup cannot be used together in the same run.'
     }
@@ -402,6 +620,9 @@ try {
     $entries = @(Read-Inventory)
     if ($entries.Count -eq 0) {
         Write-Output 'Inventory has no entries. Nothing to remediate.'
+        if (-not $DryRun) {
+            Clear-RemediationWorkArtifacts -WorkRoot $Script:WorkRoot
+        }
         exit 0
     }
 
@@ -441,6 +662,7 @@ try {
         }
         else {
             Write-Output "RestoreBackup complete. Restored DLL count: $restored"
+            Clear-RemediationWorkArtifacts -WorkRoot $Script:WorkRoot
         }
         exit 0
     }
@@ -463,9 +685,16 @@ try {
     $packageCache = @{}
     $updated = 0
     $planned = 0
+    $ignored = 0
     $skipped = New-Object System.Collections.Generic.List[string]
 
     foreach ($entry in $entries) {
+        if (Test-IsIgnoredPath -Path $entry.Path -Patterns $IgnoreList) {
+            $ignored++
+            Write-Output "Ignored: $($entry.Path)"
+            continue
+        }
+
         if (-not (Test-Path -LiteralPath $entry.Path)) {
             $skipped.Add("Missing file: $($entry.Path)")
             continue
@@ -545,8 +774,21 @@ try {
 
         $targetLock = Test-FileLockState -Path $entry.Path
         if ($targetLock.IsLocked) {
-            $skipped.Add("Locked/in-use file (skipped): $($entry.Path)")
-            continue
+            if ($UpdateAtAnyCost -and -not $DryRun) {
+                [void](Stop-LockingProcesses -Path $entry.Path)
+                Start-Sleep -Milliseconds 300
+                $targetLock = Test-FileLockState -Path $entry.Path
+            }
+
+            if ($targetLock.IsLocked) {
+                if ($UpdateAtAnyCost) {
+                    $skipped.Add("Locked/in-use file even after process termination attempt: $($entry.Path)")
+                }
+                else {
+                    $skipped.Add("Locked/in-use file (skipped): $($entry.Path)")
+                }
+                continue
+            }
         }
         if ($targetLock.AccessDenied) {
             $skipped.Add("Access denied (skipped): $($entry.Path)")
@@ -558,8 +800,21 @@ try {
             if (Test-Path -LiteralPath $backupPath) {
                 $backupLock = Test-FileLockState -Path $backupPath
                 if ($backupLock.IsLocked) {
-                    $skipped.Add("Backup file locked/in-use (skipped): $backupPath")
-                    continue
+                    if ($UpdateAtAnyCost -and -not $DryRun) {
+                        [void](Stop-LockingProcesses -Path $backupPath)
+                        Start-Sleep -Milliseconds 300
+                        $backupLock = Test-FileLockState -Path $backupPath
+                    }
+
+                    if ($backupLock.IsLocked) {
+                        if ($UpdateAtAnyCost) {
+                            $skipped.Add("Backup file still locked after process termination attempt: $backupPath")
+                        }
+                        else {
+                            $skipped.Add("Backup file locked/in-use (skipped): $backupPath")
+                        }
+                        continue
+                    }
                 }
                 if ($backupLock.AccessDenied) {
                     $skipped.Add("Backup file access denied (skipped): $backupPath")
@@ -574,6 +829,21 @@ try {
             Write-Output "Updated: $($entry.Path) -> $($packageCache[$majorKey].Version.Raw)"
         }
         catch [System.IO.IOException] {
+            if ($UpdateAtAnyCost -and -not $DryRun) {
+                [void](Stop-LockingProcesses -Path $entry.Path)
+                Start-Sleep -Milliseconds 300
+                try {
+                    Update-DllInPlace -Entry $entry -ReplacementPath $replacement -DoBackup:$WithBackup
+                    $updated++
+                    Write-Output "Updated after forced unlock: $($entry.Path) -> $($packageCache[$majorKey].Version.Raw)"
+                    continue
+                }
+                catch {
+                    $skipped.Add("I/O error during update after forced unlock attempt: $($entry.Path) [$($_.Exception.Message)]")
+                    continue
+                }
+            }
+
             $skipped.Add("I/O error during update (likely in use): $($entry.Path) [$($_.Exception.Message)]")
             continue
         }
@@ -589,14 +859,18 @@ try {
     }
 
     if ($DryRun) {
-        Write-Output "DryRun complete. Planned DLL updates: $planned"
+        Write-Output "DryRun complete. Planned DLL updates: $planned. Ignored: $ignored"
         exit 0
     }
 
-    Write-Output "Remediation complete. Updated DLL count: $updated"
+    Write-Output "Remediation complete. Updated DLL count: $updated. Ignored: $ignored"
+    Clear-RemediationWorkArtifacts -WorkRoot $Script:WorkRoot
     exit 0
 }
 catch {
     Write-Output "Remediation error: $($_.Exception.Message)"
+    if (-not $DryRun) {
+        Clear-RemediationWorkArtifacts -WorkRoot $Script:WorkRoot
+    }
     exit 1
 }

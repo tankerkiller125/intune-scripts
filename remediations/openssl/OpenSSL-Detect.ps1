@@ -15,7 +15,8 @@ Exit codes:
 
 [CmdletBinding()]
 param(
-    [switch]$VerboseMode
+    [switch]$VerboseMode,
+    [string[]]$IgnoreList = @('C:\ProgramData\IntuneOpenSSLRemediation\*')
 )
 
 Set-StrictMode -Version Latest
@@ -140,10 +141,10 @@ function Get-PortableExecutableArchitecture {
 function Get-ScanRoots {
     $roots = New-Object System.Collections.Generic.List[string]
     $candidates = @(
-        #'C:\Users',
         'C:\Program Files',
         'C:\Program Files (x86)',
-        'C:\ProgramData'
+        'C:\ProgramData',
+	'C:\Users\*\AppData'
     )
 
     foreach ($path in $candidates) {
@@ -272,8 +273,45 @@ function Get-LatestByMajor {
     return $latest
 }
 
+function Test-IsIgnoredPath {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string[]]$Patterns
+    )
+
+    if ($null -eq $Patterns -or $Patterns.Count -eq 0) {
+        return $false
+    }
+
+    $target = $Path.Trim().TrimEnd('\\').ToLowerInvariant()
+    foreach ($rawPattern in $Patterns) {
+        if ([string]::IsNullOrWhiteSpace($rawPattern)) {
+            continue
+        }
+
+        $pattern = $rawPattern.Trim().TrimEnd('\\')
+        if ($pattern.Contains('*') -or $pattern.Contains('?')) {
+            if ($Path -like $pattern) {
+                return $true
+            }
+            continue
+        }
+
+        $normalized = $pattern.ToLowerInvariant()
+        if ($target -eq $normalized -or $target.StartsWith("$normalized\\")) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
 try {
     Write-Verbose 'Starting OpenSSL detection run.'
+    if ($IgnoreList.Count -gt 0) {
+        Write-Verbose ("Ignore list entries: {0}" -f ($IgnoreList -join '; '))
+    }
+
     $inventory = @(Get-OpenSslDllInventory)
     Write-InventoryFile -Inventory $inventory
 
@@ -292,7 +330,14 @@ try {
     Write-Verbose ("Available major branches in package feed: {0}" -f (($latestByMajor.Keys | Sort-Object) -join ', '))
 
     $nonCompliant = New-Object System.Collections.Generic.List[string]
+    $ignored = 0
     foreach ($dll in $inventory) {
+        if (Test-IsIgnoredPath -Path $dll.Path -Patterns $IgnoreList) {
+            Write-Verbose ("Ignored by IgnoreList: {0}" -f $dll.Path)
+            $ignored++
+            continue
+        }
+
         if ($dll.Architecture -eq 'arm64' -and $dll.VersionMajor -eq 1) {
             $nonCompliant.Add("$($dll.Path) (OpenSSL 1.x has no ARM64 build source)")
             continue
@@ -308,6 +353,10 @@ try {
         if ((Compare-OpenSslVersion -Left $dll.Version -Right $target) -lt 0) {
             $nonCompliant.Add("$($dll.Path) ($($dll.Version.Raw) < $($target.Raw))")
         }
+    }
+
+    if ($ignored -gt 0) {
+        Write-Verbose ("Ignored DLL count: {0}" -f $ignored)
     }
 
     if ($nonCompliant.Count -gt 0) {
